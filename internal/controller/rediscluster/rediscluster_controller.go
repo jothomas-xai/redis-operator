@@ -248,6 +248,17 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	if nc := k8sutils.CheckRedisNodeCount(ctx, r.K8sClient, instance, ""); nc != totalReplicas {
 		logger.Info("Creating redis cluster by executing cluster creation commands")
+
+		// Self-heal: a follower that came up isolated (known_nodes==1) claims bogus
+		// slots/data and cannot be re-added until it is reset. Reset + re-meet +
+		// re-replicate it here so the normal cluster/replication steps below see a
+		// clean, rejoined node.
+		if features.Enabled(features.ClusterSelfHealing) {
+			if err := k8sutils.ReintegrateIsolatedFollowers(ctx, r.K8sClient, instance); err != nil {
+				logger.Error(err, "failed to reintegrate isolated followers")
+			}
+		}
+
 		leaderCount := k8sutils.CheckRedisNodeCount(ctx, r.K8sClient, instance, "leader")
 		if leaderCount != leaderReplicas {
 			logger.Info("Not all leader are part of the cluster...", "Leaders.Count", leaderCount, "Instance.Size", leaderReplicas)

@@ -596,6 +596,118 @@ func staleNodeIDs(nodes []clusterNodesResponse) []string {
 	return ids
 }
 
+// ReintegrateIsolatedFollowers re-attaches follower pods that came up isolated -
+// reporting cluster_known_nodes == 1 because they lost their identity on restart
+// and only know themselves. Such a pod cannot simply be re-added: it can claim
+// bogus slots/data, which makes re-integration fail with "node is not empty". So
+// each isolated follower is RESET + flushed clean, MET back into the cluster, and
+// REPLICATEd to its shard's current master.
+//
+// It only acts against a reference cluster (leader-0) that is healthy and already
+// covers all 16384 slots, which guarantees the isolated follower's data is
+// redundant before it is flushed, and avoids interfering during initial
+// cluster formation.
+func ReintegrateIsolatedFollowers(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster) error {
+	leaderClient := configureRedisClient(ctx, client, cr, cr.Name+"-leader-0")
+	defer leaderClient.Close()
+
+	info, err := leaderClient.ClusterInfo(ctx).Result()
+	if err != nil {
+		return err
+	}
+	ci := parseClusterInfo(info)
+	knownNodes, _ := strconv.Atoi(ci["cluster_known_nodes"])
+	if ci["cluster_state"] != "ok" || ci["cluster_slots_assigned"] != "16384" || knownNodes <= 1 {
+		return nil
+	}
+
+	nodes, err := clusterNodes(ctx, leaderClient)
+	if err != nil {
+		return err
+	}
+	leaderIP := getRedisServerIP(ctx, client, RedisDetails{PodName: cr.Name + "-leader-0", Namespace: cr.Namespace})
+	if leaderIP == "" {
+		return nil
+	}
+	port := strconv.Itoa(*cr.Spec.Port)
+
+	leaderReplicas := cr.Spec.GetReplicaCounts("leader")
+	followerReplicas := cr.Spec.GetReplicaCounts("follower")
+	for i := int32(0); i < followerReplicas; i++ {
+		podName := fmt.Sprintf("%s-follower-%d", cr.Name, i)
+		leaderPod := fmt.Sprintf("%s-leader-%d", cr.Name, i%leaderReplicas)
+		reintegrateIsolatedFollower(ctx, client, cr, podName, masterIDForShard(nodes, leaderPod), leaderIP, port)
+	}
+	return nil
+}
+
+// reintegrateIsolatedFollower resets, re-meets and re-replicates a single
+// follower pod, but only if it is actually isolated (known_nodes == 1).
+func reintegrateIsolatedFollower(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, podName, masterID, leaderIP, port string) {
+	logger := log.FromContext(ctx)
+	podClient := configureRedisClient(ctx, client, cr, podName)
+	defer podClient.Close()
+
+	info, err := podClient.ClusterInfo(ctx).Result()
+	if err != nil {
+		return
+	}
+	if parseClusterInfo(info)["cluster_known_nodes"] != "1" {
+		return // not isolated
+	}
+	if masterID == "" {
+		logger.V(1).Info("Could not determine shard master for isolated follower; skipping", "Pod", podName)
+		return
+	}
+
+	logger.Info("Re-integrating isolated follower", "Pod", podName, "Master", masterID)
+	// Make it a clean, empty node. Its data is redundant - the reference cluster
+	// already covers all 16384 slots - and a replica must be empty to attach.
+	if err := podClient.Do(ctx, "CLUSTER", "RESET", "SOFT").Err(); err != nil {
+		logger.V(1).Error(err, "CLUSTER RESET failed", "Pod", podName)
+	}
+	if err := podClient.FlushAll(ctx).Err(); err != nil {
+		logger.V(1).Error(err, "FLUSHALL failed", "Pod", podName)
+	}
+	if err := podClient.Do(ctx, "CLUSTER", "MEET", leaderIP, port).Err(); err != nil {
+		logger.V(1).Error(err, "CLUSTER MEET failed", "Pod", podName)
+		return
+	}
+	// REPLICATE can race the gossip propagation of the master id after MEET, so
+	// retry until the new node knows its master.
+	if err := retry.Do(
+		func() error { return podClient.Do(ctx, "CLUSTER", "REPLICATE", masterID).Err() },
+		retry.Attempts(5), retry.Delay(2*time.Second),
+	); err != nil {
+		logger.V(1).Error(err, "CLUSTER REPLICATE failed", "Pod", podName, "Master", masterID)
+	}
+}
+
+// masterIDForShard returns the node id of the master serving the same shard as
+// the given leader pod. If that leader pod is itself a master its own id is
+// returned; if it has failed over and is now a replica, the id of the master it
+// follows is returned. Returns "" if the pod is not found.
+func masterIDForShard(nodes []clusterNodesResponse, leaderPodName string) string {
+	for _, node := range nodes {
+		if len(node) < 4 {
+			continue
+		}
+		// node[1] is "<ip:port@bus>,<hostname>"; match the hostname exactly so
+		// "leader-1" does not match "leader-10".
+		comma := strings.LastIndex(node[1], ",")
+		if comma < 0 || node[1][comma+1:] != leaderPodName {
+			continue
+		}
+		if nodeIsOfType(node, "master") {
+			return node[0]
+		}
+		if node[3] != "-" { // replica: node[3] is the id of its master
+			return node[3]
+		}
+	}
+	return ""
+}
+
 func nodeIsOfType(node clusterNodesResponse, nodeType string) bool {
 	return strings.Contains(node[2], nodeType)
 }

@@ -118,6 +118,43 @@ id-self :6379@16379 myself,master,fail - 0 0 1 connected`
 	assert.ElementsMatch(t, []string{"id-ghost1", "id-ghost2"}, staleNodeIDs(nodes))
 }
 
+func TestMasterIDForShard(t *testing.T) {
+	// leader-0 is still its shard's master; leader-1 has failed over and is now a
+	// replica of follower-1 (the real shard-1 master); leader-2 is a master.
+	output := `m0id 10.0.0.10:6379@16379,redis-cluster-leader-0 myself,master - 0 1 1 connected 0-5460
+m1id 10.0.0.21:6379@16379,redis-cluster-follower-1 master - 0 1 2 connected 5461-10922
+l1id 10.0.0.11:6379@16379,redis-cluster-leader-1 slave m1id 0 1 2 connected
+l2id 10.0.0.12:6379@16379,redis-cluster-leader-2 master - 0 1 3 connected 10923-16383`
+
+	csvOutput := csv.NewReader(strings.NewReader(output))
+	csvOutput.Comma = ' '
+	csvOutput.FieldsPerRecord = -1
+	rawNodes, err := csvOutput.ReadAll()
+	assert.NoError(t, err)
+
+	nodes := make([]clusterNodesResponse, 0, len(rawNodes))
+	for _, node := range rawNodes {
+		nodes = append(nodes, node)
+	}
+
+	tests := []struct {
+		leaderPod string
+		want      string
+	}{
+		{"redis-cluster-leader-0", "m0id"}, // master itself
+		{"redis-cluster-leader-1", "m1id"}, // failed over -> its current master
+		{"redis-cluster-leader-2", "l2id"}, // master itself
+		{"redis-cluster-leader-9", ""},     // not present
+	}
+	for _, tt := range tests {
+		t.Run(tt.leaderPod, func(t *testing.T) {
+			if got := masterIDForShard(nodes, tt.leaderPod); got != tt.want {
+				t.Errorf("masterIDForShard(%q) = %q, want %q", tt.leaderPod, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRepairDisconnectedMasters(t *testing.T) {
 	ctx := context.Background()
 	redisClient, mock := redismock.NewClientMock()
