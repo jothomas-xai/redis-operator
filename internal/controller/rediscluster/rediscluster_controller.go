@@ -316,6 +316,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		if err := k8sutils.ForgetStaleNodes(ctx, r.K8sClient, instance); err != nil {
 			logger.Error(err, "failed to forget stale nodes")
 		}
+		if err := k8sutils.FixInvertedLeaderRoles(ctx, r.K8sClient, instance); err != nil {
+			logger.Error(err, "failed to fix inverted leader roles")
+		}
 	}
 
 	unhealthyNodeCount, err := k8sutils.UnhealthyNodesInCluster(ctx, r.K8sClient, instance)

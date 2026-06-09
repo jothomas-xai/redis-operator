@@ -708,6 +708,69 @@ func masterIDForShard(nodes []clusterNodesResponse, leaderPodName string) string
 	return ""
 }
 
+// FixInvertedLeaderRoles promotes any leader pod that has failed over and is now
+// a replica back to master via CLUSTER FAILOVER. The operator's index-based
+// scale-down assumes leader-i pods are masters, so a lingering inversion breaks
+// it. Note this is a deliberate trade-off: re-promoting means a legitimate
+// failover is followed by a corrective one, so it is gated behind
+// ClusterSelfHealing rather than always-on.
+//
+// It only acts on a healthy, fully-covered, stable cluster (no failed nodes), so
+// it never forces a failover during an outage or transition.
+func FixInvertedLeaderRoles(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster) error {
+	leaderClient := configureRedisClient(ctx, client, cr, cr.Name+"-leader-0")
+	defer leaderClient.Close()
+
+	info, err := leaderClient.ClusterInfo(ctx).Result()
+	if err != nil {
+		return err
+	}
+	ci := parseClusterInfo(info)
+	if ci["cluster_state"] != "ok" || ci["cluster_slots_assigned"] != "16384" {
+		return nil
+	}
+	nodes, err := clusterNodes(ctx, leaderClient)
+	if err != nil {
+		return err
+	}
+	for _, node := range nodes {
+		if nodeIsFailed(node) {
+			return nil // topology unstable; don't realign roles now
+		}
+	}
+
+	leaderReplicas := cr.Spec.GetReplicaCounts("leader")
+	logger := log.FromContext(ctx)
+	for i := int32(0); i < leaderReplicas; i++ {
+		leaderPod := fmt.Sprintf("%s-leader-%d", cr.Name, i)
+		if !leaderPodIsReplica(nodes, leaderPod) {
+			continue
+		}
+		logger.Info("Leader pod has failed over to a replica; promoting it back via CLUSTER FAILOVER", "Pod", leaderPod)
+		if err := ClusterFailover(ctx, client, cr, i); err != nil {
+			logger.Error(err, "CLUSTER FAILOVER failed", "Pod", leaderPod)
+		}
+	}
+	return nil
+}
+
+// leaderPodIsReplica reports whether the given leader pod currently appears as a
+// replica in CLUSTER NODES - an "inverted" role (it failed over). Returns false
+// if it is a master or not found.
+func leaderPodIsReplica(nodes []clusterNodesResponse, leaderPodName string) bool {
+	for _, node := range nodes {
+		if len(node) < 3 {
+			continue
+		}
+		comma := strings.LastIndex(node[1], ",")
+		if comma < 0 || node[1][comma+1:] != leaderPodName {
+			continue
+		}
+		return nodeIsOfType(node, "slave")
+	}
+	return false
+}
+
 func nodeIsOfType(node clusterNodesResponse, nodeType string) bool {
 	return strings.Contains(node[2], nodeType)
 }

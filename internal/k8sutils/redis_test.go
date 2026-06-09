@@ -155,6 +155,43 @@ l2id 10.0.0.12:6379@16379,redis-cluster-leader-2 master - 0 1 3 connected 10923-
 	}
 }
 
+func TestLeaderPodIsReplica(t *testing.T) {
+	// leader-0 and leader-2 are masters; leader-1 has failed over and is now a
+	// replica of follower-1.
+	output := `m0 10.0.0.10:6379@16379,redis-cluster-leader-0 myself,master - 0 1 1 connected 0-5460
+m1 10.0.0.21:6379@16379,redis-cluster-follower-1 master - 0 1 2 connected 5461-10922
+l1 10.0.0.11:6379@16379,redis-cluster-leader-1 slave m1 0 1 2 connected
+l2 10.0.0.12:6379@16379,redis-cluster-leader-2 master - 0 1 3 connected 10923-16383`
+
+	csvOutput := csv.NewReader(strings.NewReader(output))
+	csvOutput.Comma = ' '
+	csvOutput.FieldsPerRecord = -1
+	rawNodes, err := csvOutput.ReadAll()
+	assert.NoError(t, err)
+
+	nodes := make([]clusterNodesResponse, 0, len(rawNodes))
+	for _, node := range rawNodes {
+		nodes = append(nodes, node)
+	}
+
+	tests := []struct {
+		leaderPod string
+		want      bool
+	}{
+		{"redis-cluster-leader-0", false}, // master
+		{"redis-cluster-leader-1", true},  // inverted (now a replica)
+		{"redis-cluster-leader-2", false}, // master
+		{"redis-cluster-leader-9", false}, // not present
+	}
+	for _, tt := range tests {
+		t.Run(tt.leaderPod, func(t *testing.T) {
+			if got := leaderPodIsReplica(nodes, tt.leaderPod); got != tt.want {
+				t.Errorf("leaderPodIsReplica(%q) = %v, want %v", tt.leaderPod, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRepairDisconnectedMasters(t *testing.T) {
 	ctx := context.Background()
 	redisClient, mock := redismock.NewClientMock()
