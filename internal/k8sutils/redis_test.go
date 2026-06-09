@@ -192,6 +192,44 @@ l2 10.0.0.12:6379@16379,redis-cluster-leader-2 master - 0 1 3 connected 10923-16
 	}
 }
 
+func TestFollowerMasterID(t *testing.T) {
+	// follower-0 replicates m0; follower-1 replicates m1; follower-2 is itself a
+	// master (e.g. promoted), so it is not replicating anyone.
+	output := `m0 10.0.0.10:6379@16379,redis-cluster-leader-0 myself,master - 0 1 1 connected 0-5460
+m1 10.0.0.11:6379@16379,redis-cluster-leader-1 master - 0 1 2 connected 5461-10922
+f0 10.0.0.13:6379@16379,redis-cluster-follower-0 slave m0 0 1 1 connected
+f1 10.0.0.14:6379@16379,redis-cluster-follower-1 slave m1 0 1 2 connected
+f2 10.0.0.15:6379@16379,redis-cluster-follower-2 master - 0 1 3 connected 10923-16383`
+
+	csvOutput := csv.NewReader(strings.NewReader(output))
+	csvOutput.Comma = ' '
+	csvOutput.FieldsPerRecord = -1
+	rawNodes, err := csvOutput.ReadAll()
+	assert.NoError(t, err)
+
+	nodes := make([]clusterNodesResponse, 0, len(rawNodes))
+	for _, node := range rawNodes {
+		nodes = append(nodes, node)
+	}
+
+	tests := []struct {
+		followerPod string
+		want        string
+	}{
+		{"redis-cluster-follower-0", "m0"}, // replicating m0
+		{"redis-cluster-follower-1", "m1"}, // replicating m1
+		{"redis-cluster-follower-2", ""},   // a master, not replicating
+		{"redis-cluster-follower-9", ""},   // not present
+	}
+	for _, tt := range tests {
+		t.Run(tt.followerPod, func(t *testing.T) {
+			if got := followerMasterID(nodes, tt.followerPod); got != tt.want {
+				t.Errorf("followerMasterID(%q) = %q, want %q", tt.followerPod, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRepairDisconnectedMasters(t *testing.T) {
 	ctx := context.Background()
 	redisClient, mock := redismock.NewClientMock()

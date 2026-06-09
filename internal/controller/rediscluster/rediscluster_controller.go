@@ -319,6 +319,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		if err := k8sutils.FixInvertedLeaderRoles(ctx, r.K8sClient, instance); err != nil {
 			logger.Error(err, "failed to fix inverted leader roles")
 		}
+		if err := k8sutils.FixCrosswiredFollowers(ctx, r.K8sClient, instance); err != nil {
+			logger.Error(err, "failed to fix crosswired followers")
+		}
 	}
 
 	unhealthyNodeCount, err := k8sutils.UnhealthyNodesInCluster(ctx, r.K8sClient, instance)

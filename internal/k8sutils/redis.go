@@ -771,6 +771,78 @@ func leaderPodIsReplica(nodes []clusterNodesResponse, leaderPodName string) bool
 	return false
 }
 
+// FixCrosswiredFollowers re-points any follower that is replicating the wrong
+// master back to its shard's master. The operator pairs follower-i with
+// leader-(i % leaders), so a follower replicating a different shard's master is
+// "crosswired". Unlike an isolated follower it is already a healthy cluster
+// member, so a single CLUSTER REPLICATE to the correct master is enough (the
+// node resyncs from the new master automatically).
+//
+// It only acts on a healthy, fully-covered, stable cluster (no failed nodes).
+func FixCrosswiredFollowers(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster) error {
+	leaderClient := configureRedisClient(ctx, client, cr, cr.Name+"-leader-0")
+	defer leaderClient.Close()
+
+	info, err := leaderClient.ClusterInfo(ctx).Result()
+	if err != nil {
+		return err
+	}
+	ci := parseClusterInfo(info)
+	if ci["cluster_state"] != "ok" || ci["cluster_slots_assigned"] != "16384" {
+		return nil
+	}
+	nodes, err := clusterNodes(ctx, leaderClient)
+	if err != nil {
+		return err
+	}
+	for _, node := range nodes {
+		if nodeIsFailed(node) {
+			return nil // topology unstable; don't re-wire now
+		}
+	}
+
+	leaderReplicas := cr.Spec.GetReplicaCounts("leader")
+	followerReplicas := cr.Spec.GetReplicaCounts("follower")
+	logger := log.FromContext(ctx)
+	for i := int32(0); i < followerReplicas; i++ {
+		followerPod := fmt.Sprintf("%s-follower-%d", cr.Name, i)
+		actualMaster := followerMasterID(nodes, followerPod)
+		if actualMaster == "" {
+			continue // not currently a replica (handled elsewhere)
+		}
+		expectedMaster := masterIDForShard(nodes, fmt.Sprintf("%s-leader-%d", cr.Name, i%leaderReplicas))
+		if expectedMaster == "" || actualMaster == expectedMaster {
+			continue
+		}
+		logger.Info("Follower is replicating the wrong master; re-wiring", "Pod", followerPod, "From", actualMaster, "To", expectedMaster)
+		podClient := configureRedisClient(ctx, client, cr, followerPod)
+		if err := podClient.Do(ctx, "CLUSTER", "REPLICATE", expectedMaster).Err(); err != nil {
+			logger.V(1).Error(err, "CLUSTER REPLICATE failed", "Pod", followerPod, "Master", expectedMaster)
+		}
+		podClient.Close()
+	}
+	return nil
+}
+
+// followerMasterID returns the id of the master the given follower pod is
+// replicating, or "" if the pod is itself a master or not found.
+func followerMasterID(nodes []clusterNodesResponse, followerPodName string) string {
+	for _, node := range nodes {
+		if len(node) < 4 {
+			continue
+		}
+		comma := strings.LastIndex(node[1], ",")
+		if comma < 0 || node[1][comma+1:] != followerPodName {
+			continue
+		}
+		if nodeIsOfType(node, "slave") {
+			return node[3]
+		}
+		return "" // it is a master, not replicating anyone
+	}
+	return ""
+}
+
 func nodeIsOfType(node clusterNodesResponse, nodeType string) bool {
 	return strings.Contains(node[2], nodeType)
 }
