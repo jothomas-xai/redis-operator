@@ -93,6 +93,31 @@ id-ghost 10.0.0.99:6379@16379,redis-cluster-leader-1 master,fail - 1700000000000
 	}
 }
 
+func TestStaleNodeIDs(t *testing.T) {
+	// Healthy nodes, plus a "master,fail" ghost, a "fail,noaddr" ghost, and a
+	// "myself,master,fail" node that must NOT be forgotten (you can't forget the
+	// querying node).
+	output := `id-m0 10.0.0.10:6379@16379,redis-cluster-leader-0 myself,master - 0 1 1 connected 0-5460
+id-m1 10.0.0.11:6379@16379,redis-cluster-leader-1 master - 0 1 2 connected 5461-10922
+id-s0 10.0.0.13:6379@16379,redis-cluster-follower-0 slave id-m0 0 1 1 connected
+id-ghost1 10.0.0.99:6379@16379,redis-cluster-leader-1 master,fail - 1700000000000 1700000000000 2 connected
+id-ghost2 :0@0 master,fail,noaddr - 0 0 0 disconnected
+id-self :6379@16379 myself,master,fail - 0 0 1 connected`
+
+	csvOutput := csv.NewReader(strings.NewReader(output))
+	csvOutput.Comma = ' '
+	csvOutput.FieldsPerRecord = -1
+	rawNodes, err := csvOutput.ReadAll()
+	assert.NoError(t, err)
+
+	nodes := make([]clusterNodesResponse, 0, len(rawNodes))
+	for _, node := range rawNodes {
+		nodes = append(nodes, node)
+	}
+
+	assert.ElementsMatch(t, []string{"id-ghost1", "id-ghost2"}, staleNodeIDs(nodes))
+}
+
 func TestRepairDisconnectedMasters(t *testing.T) {
 	ctx := context.Background()
 	redisClient, mock := redismock.NewClientMock()

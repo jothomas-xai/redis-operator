@@ -98,7 +98,8 @@ func addFlags(cmd *cobra.Command, opts *managerOptions) {
 	cmd.Flags().BoolVar(&opts.enableWebhooks, "enable-webhooks", envs.IsWebhookEnabled(), "Enable webhooks")
 	cmd.Flags().IntVar(&opts.maxConcurrentReconciles, "max-concurrent-reconciles", 1, "Max concurrent reconciles")
 	cmd.Flags().StringVar(&opts.featureGatesString, "feature-gates", envs.GetFeatureGates(), "A set of key=value pairs that describe feature gates for alpha/experimental features. "+
-		"Options are:\n  GenerateConfigInInitContainer=true|false: enables using init container for config generation")
+		"Options are:\n  GenerateConfigInInitContainer=true|false: enables using init container for config generation"+
+		"\n  ClusterSelfHealing=true|false: enables auto-repair of cluster topology (evicts stale ghost nodes)")
 	cmd.Flags().Duration(
 		operator.KubeClientTimeoutMGRFlag,
 		60*time.Second,

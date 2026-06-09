@@ -27,6 +27,7 @@ import (
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common/events"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common/redis"
 	intctrlutil "github.com/OT-CONTAINER-KIT/redis-operator/internal/controllerutil"
+	"github.com/OT-CONTAINER-KIT/redis-operator/internal/features"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/k8sutils"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/monitoring"
 	retry "github.com/avast/retry-go"
@@ -294,6 +295,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	logger.Info("Number of Redis nodes match desired")
+
+	// Self-heal: evict stale "fail"/"noaddr" ghost nodes left behind when a pod
+	// lost its identity on restart. This runs only once the full complement of
+	// real nodes is present (the node count above matched desired), so a node
+	// that is transiently failing during an outage is never forgotten while it
+	// may still recover.
+	if features.Enabled(features.ClusterSelfHealing) {
+		if err := k8sutils.ForgetStaleNodes(ctx, r.K8sClient, instance); err != nil {
+			logger.Error(err, "failed to forget stale nodes")
+		}
+	}
+
 	unhealthyNodeCount, err := k8sutils.UnhealthyNodesInCluster(ctx, r.K8sClient, instance)
 	if err != nil {
 		logger.Error(err, "failed to determine unhealthy node count in cluster")

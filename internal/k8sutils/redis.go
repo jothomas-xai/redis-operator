@@ -540,6 +540,62 @@ func UnhealthyNodesInCluster(ctx context.Context, client kubernetes.Interface, c
 	return count, nil
 }
 
+// ForgetStaleNodes evicts ghost nodes the cluster has flagged as failed or with
+// no address - the entries left behind when a pod loses its identity after a
+// restart. It issues CLUSTER FORGET for each stale node id on every expected
+// pod: CLUSTER FORGET only blacklists a node for 60 seconds, so any pod that
+// still knows the id would otherwise re-introduce it through gossip.
+func ForgetStaleNodes(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster) error {
+	leaderClient := configureRedisClient(ctx, client, cr, cr.Name+"-leader-0")
+	defer leaderClient.Close()
+	nodes, err := clusterNodes(ctx, leaderClient)
+	if err != nil {
+		return err
+	}
+	staleIDs := staleNodeIDs(nodes)
+	if len(staleIDs) == 0 {
+		return nil
+	}
+
+	logger := log.FromContext(ctx)
+	logger.Info("Forgetting stale cluster nodes", "Count", len(staleIDs), "Nodes", staleIDs)
+
+	leaderReplicas := cr.Spec.GetReplicaCounts("leader")
+	followerReplicas := cr.Spec.GetReplicaCounts("follower")
+	pods := make([]string, 0, leaderReplicas+followerReplicas)
+	for i := int32(0); i < leaderReplicas; i++ {
+		pods = append(pods, fmt.Sprintf("%s-leader-%d", cr.Name, i))
+	}
+	for i := int32(0); i < followerReplicas; i++ {
+		pods = append(pods, fmt.Sprintf("%s-follower-%d", cr.Name, i))
+	}
+
+	for _, podName := range pods {
+		podClient := configureRedisClient(ctx, client, cr, podName)
+		for _, id := range staleIDs {
+			// "Unknown node" simply means this pod already does not know the id,
+			// which is the desired end state, so it is not an error.
+			if err := podClient.ClusterForget(ctx, id).Err(); err != nil && !strings.Contains(err.Error(), "Unknown node") {
+				logger.V(1).Error(err, "CLUSTER FORGET failed", "Pod", podName, "Node", id)
+			}
+		}
+		podClient.Close()
+	}
+	return nil
+}
+
+// staleNodeIDs returns the ids of nodes the cluster considers stale (flagged
+// failed or with no address), excluding the node we are querying from.
+func staleNodeIDs(nodes []clusterNodesResponse) []string {
+	var ids []string
+	for _, node := range nodes {
+		if nodeIsStale(node) {
+			ids = append(ids, node[0])
+		}
+	}
+	return ids
+}
+
 func nodeIsOfType(node clusterNodesResponse, nodeType string) bool {
 	return strings.Contains(node[2], nodeType)
 }
@@ -549,6 +605,16 @@ func nodeIsOfType(node clusterNodesResponse, nodeType string) bool {
 // "fail?"/pfail while it is suspected), so a substring match covers both.
 func nodeIsFailed(node clusterNodesResponse) bool {
 	return strings.Contains(node[2], "fail")
+}
+
+// nodeIsStale reports whether a node is a ghost the cluster wants gone: flagged
+// failed ("fail"/pfail) or with no known address ("noaddr"), and not the node we
+// are querying from ("myself").
+func nodeIsStale(node clusterNodesResponse) bool {
+	if strings.Contains(node[2], "myself") {
+		return false
+	}
+	return strings.Contains(node[2], "fail") || strings.Contains(node[2], "noaddr")
 }
 
 func nodeFailedOrDisconnected(node clusterNodesResponse) bool {
