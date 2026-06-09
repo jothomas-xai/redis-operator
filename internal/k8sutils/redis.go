@@ -397,17 +397,33 @@ func executeFailoverCommand(ctx context.Context, client kubernetes.Interface, cr
 	return nil
 }
 
-// CheckRedisNodeCount will check the count of redis nodes
+// CheckRedisNodeCount will check the count of redis nodes, excluding any stale
+// nodes the cluster has flagged as failed.
 func CheckRedisNodeCount(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, nodeType string) int32 {
 	redisClient := configureRedisClient(ctx, client, cr, cr.Name+"-leader-0")
 	defer redisClient.Close()
-	var redisNodeType string
 	clusterNodes, err := clusterNodes(ctx, redisClient)
 	if err != nil {
 		log.FromContext(ctx).Error(err, "failed to get cluster nodes")
 	}
-	count := len(clusterNodes)
+	count := countClusterNodes(clusterNodes, nodeType)
+	if nodeType != "" {
+		log.FromContext(ctx).V(1).Info("Number of redis nodes are", "Nodes", strconv.Itoa(int(count)), "Type", nodeType)
+	} else {
+		log.FromContext(ctx).V(1).Info("Total number of redis nodes are", "Nodes", strconv.Itoa(int(count)))
+	}
+	return count
+}
 
+// countClusterNodes counts cluster nodes of the requested type ("leader",
+// "follower", or "" for every node), skipping any node the cluster has flagged
+// as failed. Stale "master,fail" ghosts - left behind when a pod loses its
+// identity after a restart - would otherwise be counted as live members,
+// inflating the leader and total node counts. That inflation traps
+// reconciliation in an early-return loop and stops the operator from ever
+// reaching its relabel/repair logic.
+func countClusterNodes(nodes []clusterNodesResponse, nodeType string) int32 {
+	var redisNodeType string
 	switch nodeType {
 	case "leader":
 		redisNodeType = "master"
@@ -416,18 +432,17 @@ func CheckRedisNodeCount(ctx context.Context, client kubernetes.Interface, cr *r
 	default:
 		redisNodeType = nodeType
 	}
-	if nodeType != "" {
-		count = 0
-		for _, node := range clusterNodes {
-			if nodeIsOfType(node, redisNodeType) {
-				count++
-			}
+
+	var count int32
+	for _, node := range nodes {
+		if nodeIsFailed(node) {
+			continue
 		}
-		log.FromContext(ctx).V(1).Info("Number of redis nodes are", "Nodes", strconv.Itoa(count), "Type", nodeType)
-	} else {
-		log.FromContext(ctx).V(1).Info("Total number of redis nodes are", "Nodes", strconv.Itoa(count))
+		if redisNodeType == "" || nodeIsOfType(node, redisNodeType) {
+			count++
+		}
 	}
-	return int32(count)
+	return count
 }
 
 // RedisClusterStatusHealth use `redis-cli --cluster check 127.0.0.1:6379`
@@ -527,6 +542,13 @@ func UnhealthyNodesInCluster(ctx context.Context, client kubernetes.Interface, c
 
 func nodeIsOfType(node clusterNodesResponse, nodeType string) bool {
 	return strings.Contains(node[2], nodeType)
+}
+
+// nodeIsFailed reports whether the cluster has flagged the node as failed. The
+// flags field carries "fail" once the cluster agrees a node is down (and
+// "fail?"/pfail while it is suspected), so a substring match covers both.
+func nodeIsFailed(node clusterNodesResponse) bool {
+	return strings.Contains(node[2], "fail")
 }
 
 func nodeFailedOrDisconnected(node clusterNodesResponse) bool {
