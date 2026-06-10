@@ -230,6 +230,51 @@ f2 10.0.0.15:6379@16379,redis-cluster-follower-2 master - 0 1 3 connected 10923-
 	}
 }
 
+func TestSplitMirrorsets(t *testing.T) {
+	// shard 0: leader-0 (master 0-5460) + follower-0 (master 5461-6000) -> SPLIT.
+	// shard 1: leader-1 master, follower-1 replica -> normal.
+	// shard 2: leader-2 replica, follower-2 master -> normal (post-failover).
+	output := `l0 10.0.0.10:6379@16379,redis-cluster-leader-0 myself,master - 0 1 1 connected 0-5460
+f0 10.0.0.13:6379@16379,redis-cluster-follower-0 master - 0 1 5 connected 5461-6000
+l1 10.0.0.11:6379@16379,redis-cluster-leader-1 master - 0 1 2 connected 6001-10922
+f1 10.0.0.14:6379@16379,redis-cluster-follower-1 slave l1 0 1 2 connected
+l2 10.0.0.12:6379@16379,redis-cluster-leader-2 slave f2id 0 1 3 connected
+f2 10.0.0.15:6379@16379,redis-cluster-follower-2 master - 0 1 6 connected 10923-16383`
+
+	csvOutput := csv.NewReader(strings.NewReader(output))
+	csvOutput.Comma = ' '
+	csvOutput.FieldsPerRecord = -1
+	rawNodes, err := csvOutput.ReadAll()
+	assert.NoError(t, err)
+
+	nodes := make([]clusterNodesResponse, 0, len(rawNodes))
+	for _, node := range rawNodes {
+		nodes = append(nodes, node)
+	}
+
+	splits := splitMirrorsets(nodes, "redis-cluster", 3, 3)
+	assert.Len(t, splits, 1)
+	assert.Equal(t, "l0", splits[0].keeperID) // leader-0 has more slots, so it keeps
+	assert.Equal(t, "redis-cluster-leader-0", splits[0].keeperPod)
+	assert.Len(t, splits[0].extras, 1)
+	assert.Equal(t, "f0", splits[0].extras[0].id)
+	assert.Equal(t, "redis-cluster-follower-0", splits[0].extras[0].pod)
+}
+
+func TestNodeSlotCount(t *testing.T) {
+	parse := func(line string) clusterNodesResponse {
+		r := csv.NewReader(strings.NewReader(line))
+		r.Comma = ' '
+		r.FieldsPerRecord = -1
+		rec, _ := r.ReadAll()
+		return rec[0]
+	}
+	assert.Equal(t, 5461, nodeSlotCount(parse(`x ip,host master - 0 1 1 connected 0-5460`)))
+	assert.Equal(t, 3, nodeSlotCount(parse(`x ip,host master - 0 1 1 connected 1 2 3`)))
+	assert.Equal(t, 0, nodeSlotCount(parse(`x ip,host slave m 0 1 1 connected`)))                  // replica, no slots
+	assert.Equal(t, 1, nodeSlotCount(parse(`x ip,host master - 0 1 1 connected 100 [200->-abc]`))) // open-slot marker ignored
+}
+
 func TestRepairDisconnectedMasters(t *testing.T) {
 	ctx := context.Background()
 	redisClient, mock := redismock.NewClientMock()

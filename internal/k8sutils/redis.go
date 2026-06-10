@@ -843,6 +843,181 @@ func followerMasterID(nodes []clusterNodesResponse, followerPodName string) stri
 	return ""
 }
 
+// nodeRef identifies a redis node by its cluster id and its pod name.
+type nodeRef struct {
+	id  string
+	pod string
+}
+
+// shardSplit describes a shard whose pods include more than one slot-owning
+// master. The keeper retains its slots; the extras' slots are folded into it.
+type shardSplit struct {
+	keeperID  string
+	keeperPod string
+	extras    []nodeRef
+}
+
+// nodeSlotCount returns how many hash slots a node owns according to its
+// CLUSTER NODES line. Open-slot markers ("[...]") are not counted.
+func nodeSlotCount(node clusterNodesResponse) int {
+	if len(node) < 9 {
+		return 0
+	}
+	count := 0
+	for _, tok := range node[8:] {
+		if strings.HasPrefix(tok, "[") {
+			continue // migrating/importing marker, not an owned slot
+		}
+		if dash := strings.IndexByte(tok, '-'); dash > 0 {
+			start, err1 := strconv.Atoi(tok[:dash])
+			end, err2 := strconv.Atoi(tok[dash+1:])
+			if err1 == nil && err2 == nil && end >= start {
+				count += end - start + 1
+			}
+		} else if _, err := strconv.Atoi(tok); err == nil {
+			count++
+		}
+	}
+	return count
+}
+
+// splitMirrorsets finds shards (leader-i plus its followers follower-{i, i+leaders, ...})
+// where more than one pod is a master owning slots - a "split mirror set". For
+// each, the master with the most slots is the keeper and the rest are extras to
+// be folded back in.
+func splitMirrorsets(nodes []clusterNodesResponse, clusterName string, leaders, followers int32) []shardSplit {
+	byHost := make(map[string]clusterNodesResponse, len(nodes))
+	for _, node := range nodes {
+		if len(node) < 3 {
+			continue
+		}
+		if comma := strings.LastIndex(node[1], ","); comma >= 0 {
+			byHost[node[1][comma+1:]] = node
+		}
+	}
+
+	var splits []shardSplit
+	for i := int32(0); i < leaders; i++ {
+		podNames := []string{fmt.Sprintf("%s-leader-%d", clusterName, i)}
+		for j := i; j < followers; j += leaders {
+			podNames = append(podNames, fmt.Sprintf("%s-follower-%d", clusterName, j))
+		}
+
+		type master struct {
+			ref   nodeRef
+			slots int
+		}
+		var masters []master
+		for _, pod := range podNames {
+			node, ok := byHost[pod]
+			if !ok || !nodeIsOfType(node, "master") {
+				continue
+			}
+			if s := nodeSlotCount(node); s > 0 {
+				masters = append(masters, master{ref: nodeRef{id: node[0], pod: pod}, slots: s})
+			}
+		}
+		if len(masters) < 2 {
+			continue // not split
+		}
+
+		keeper := 0
+		for k := 1; k < len(masters); k++ {
+			if masters[k].slots > masters[keeper].slots {
+				keeper = k
+			}
+		}
+		split := shardSplit{keeperID: masters[keeper].ref.id, keeperPod: masters[keeper].ref.pod}
+		for k := range masters {
+			if k != keeper {
+				split.extras = append(split.extras, masters[k].ref)
+			}
+		}
+		splits = append(splits, split)
+	}
+	return splits
+}
+
+// FixSplitMirrorsets consolidates shards that ended up with more than one
+// slot-owning master (e.g. after a split-brain). For each extra master it moves
+// all of its slots onto the keeper via redis-cli reshard (which migrates keys
+// safely) and then makes the now-empty node a replica of the keeper.
+//
+// It only acts on a healthy, fully-covered, stable cluster with no in-flight slot
+// migrations, so it never starts a reshard on top of another.
+func FixSplitMirrorsets(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster) error {
+	leaderClient := configureRedisClient(ctx, client, cr, cr.Name+"-leader-0")
+	defer leaderClient.Close()
+
+	info, err := leaderClient.ClusterInfo(ctx).Result()
+	if err != nil {
+		return err
+	}
+	ci := parseClusterInfo(info)
+	if ci["cluster_state"] != "ok" || ci["cluster_slots_assigned"] != "16384" {
+		return nil
+	}
+	nodes, err := clusterNodes(ctx, leaderClient)
+	if err != nil {
+		return err
+	}
+	for _, node := range nodes {
+		if nodeIsFailed(node) {
+			return nil // topology unstable
+		}
+	}
+	if clusterHasOpenSlots(nodes) {
+		log.FromContext(ctx).Info("Open slots present; deferring split-mirrorset heal until the cluster settles")
+		return nil
+	}
+
+	logger := log.FromContext(ctx)
+	for _, split := range splitMirrorsets(nodes, cr.Name, cr.Spec.GetReplicaCounts("leader"), cr.Spec.GetReplicaCounts("follower")) {
+		for _, extra := range split.extras {
+			logger.Info("Split mirror set: folding extra master into keeper", "Keeper", split.keeperPod, "Extra", extra.pod)
+			if err := reshardAllSlots(ctx, client, cr, extra.id, split.keeperID, split.keeperPod); err != nil {
+				logger.Error(err, "reshard failed", "Extra", extra.pod)
+				continue
+			}
+			extraClient := configureRedisClient(ctx, client, cr, extra.pod)
+			if err := extraClient.Do(ctx, "CLUSTER", "REPLICATE", split.keeperID).Err(); err != nil {
+				logger.V(1).Error(err, "CLUSTER REPLICATE failed", "Extra", extra.pod)
+			}
+			extraClient.Close()
+		}
+	}
+	return nil
+}
+
+// reshardAllSlots moves every slot owned by fromID onto toID using redis-cli,
+// which migrates the keys as it goes. It is the node-id-based generalisation of
+// ReshardRedisCluster (which only works between leader pods by index).
+func reshardAllSlots(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, fromID, toID, toPod string) error {
+	redisClient := configureRedisClient(ctx, client, cr, toPod)
+	defer redisClient.Close()
+
+	slots := getRedisClusterSlots(ctx, redisClient, fromID)
+	if slots == "0" || slots == "" {
+		return nil
+	}
+
+	toPodDetails := RedisDetails{PodName: toPod, Namespace: cr.Namespace}
+	cmd := []string{"redis-cli", "--cluster", "reshard", getEndpoint(ctx, client, cr, toPodDetails)}
+	if cr.Spec.KubernetesConfig.ExistingPasswordSecret != nil {
+		pass, err := getRedisPassword(ctx, client, cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
+		if err != nil {
+			return err
+		}
+		cmd = append(cmd, "-a", pass)
+	}
+	cmd = append(cmd, getRedisTLSArgs(cr.Spec.TLS, toPod)...)
+	cmd = append(cmd, "--cluster-from", fromID, "--cluster-to", toID, "--cluster-slots", slots, "--cluster-yes")
+
+	log.FromContext(ctx).Info("Resharding slots to consolidate split mirror set", "Slots", slots, "From", fromID, "To", toID)
+	executeCommand(ctx, client, cr, cmd, toPod)
+	return nil
+}
+
 func nodeIsOfType(node clusterNodesResponse, nodeType string) bool {
 	return strings.Contains(node[2], nodeType)
 }
