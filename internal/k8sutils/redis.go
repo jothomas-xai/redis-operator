@@ -989,6 +989,93 @@ func FixSplitMirrorsets(ctx context.Context, client kubernetes.Interface, cr *rc
 	return nil
 }
 
+// MeetMissingNodes re-introduces expected pods that are running and reachable
+// but absent from the reference cluster's gossip view - e.g. after a partition
+// or a restart with a new IP, where different nodes disagree about who is in the
+// cluster. Only clean (slot-less) pods are met, so a node still carrying a
+// conflicting slot configuration is never merged automatically (that is left to
+// FixSplitMirrorsets / manual repair).
+func MeetMissingNodes(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster) error {
+	leaderClient := configureRedisClient(ctx, client, cr, cr.Name+"-leader-0")
+	defer leaderClient.Close()
+
+	info, err := leaderClient.ClusterInfo(ctx).Result()
+	if err != nil {
+		return err
+	}
+	if parseClusterInfo(info)["cluster_state"] != "ok" {
+		return nil
+	}
+	nodes, err := clusterNodes(ctx, leaderClient)
+	if err != nil {
+		return err
+	}
+	known := knownClusterIPs(nodes)
+	port := strconv.Itoa(*cr.Spec.Port)
+	logger := log.FromContext(ctx)
+
+	leaderReplicas := cr.Spec.GetReplicaCounts("leader")
+	followerReplicas := cr.Spec.GetReplicaCounts("follower")
+	pods := make([]string, 0, leaderReplicas+followerReplicas)
+	for i := int32(0); i < leaderReplicas; i++ {
+		pods = append(pods, fmt.Sprintf("%s-leader-%d", cr.Name, i))
+	}
+	for i := int32(0); i < followerReplicas; i++ {
+		pods = append(pods, fmt.Sprintf("%s-follower-%d", cr.Name, i))
+	}
+
+	for _, podName := range pods {
+		ip := getRedisServerIP(ctx, client, RedisDetails{PodName: podName, Namespace: cr.Namespace})
+		if ip == "" || known[ip] {
+			continue // not running, or already part of the cluster's view
+		}
+		if podOwnsSlots(ctx, client, cr, podName) {
+			logger.Info("Missing pod still owns slots; not auto-meeting (possible split-brain)", "Pod", podName)
+			continue
+		}
+		logger.Info("Pod is running but missing from the cluster view; CLUSTER MEET", "Pod", podName, "IP", ip)
+		if err := leaderClient.ClusterMeet(ctx, ip, port).Err(); err != nil {
+			logger.V(1).Error(err, "CLUSTER MEET failed", "Pod", podName)
+		}
+	}
+	return nil
+}
+
+// knownClusterIPs returns the set of node IPs present in a CLUSTER NODES listing.
+func knownClusterIPs(nodes []clusterNodesResponse) map[string]bool {
+	known := make(map[string]bool, len(nodes))
+	for _, node := range nodes {
+		if len(node) < 2 {
+			continue
+		}
+		addr := node[1] // "<ip>:<port>@<bus>,<hostname>"
+		at := strings.IndexByte(addr, '@')
+		if at <= 0 {
+			continue
+		}
+		if colon := strings.LastIndexByte(addr[:at], ':'); colon > 0 {
+			known[addr[:colon]] = true
+		}
+	}
+	return known
+}
+
+// podOwnsSlots reports whether the given pod's own view shows it owning any slots.
+func podOwnsSlots(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, podName string) bool {
+	podClient := configureRedisClient(ctx, client, cr, podName)
+	defer podClient.Close()
+	nodes, err := clusterNodes(ctx, podClient)
+	if err != nil {
+		return false
+	}
+	for _, node := range nodes {
+		if len(node) >= 3 && strings.Contains(node[2], "myself") {
+			return nodeSlotCount(node) > 0
+		}
+	}
+	return false
+}
+
 // reshardAllSlots moves every slot owned by fromID onto toID using redis-cli,
 // which migrates the keys as it goes. It is the node-id-based generalisation of
 // ReshardRedisCluster (which only works between leader pods by index).

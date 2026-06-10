@@ -257,6 +257,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			if err := k8sutils.ReintegrateIsolatedFollowers(ctx, r.K8sClient, instance); err != nil {
 				logger.Error(err, "failed to reintegrate isolated followers")
 			}
+			if err := k8sutils.MeetMissingNodes(ctx, r.K8sClient, instance); err != nil {
+				logger.Error(err, "failed to meet missing nodes")
+			}
 		}
 
 		leaderCount := k8sutils.CheckRedisNodeCount(ctx, r.K8sClient, instance, "leader")

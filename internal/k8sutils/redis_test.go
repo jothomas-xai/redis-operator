@@ -276,6 +276,29 @@ func TestNodeSlotCount(t *testing.T) {
 	assert.Equal(t, 1, nodeSlotCount(parse(`x ip,host master - 0 1 1 connected 100 [200->-abc]`))) // open-slot marker ignored
 }
 
+func TestKnownClusterIPs(t *testing.T) {
+	output := `id0 10.0.0.10:6379@16379,redis-cluster-leader-0 myself,master - 0 1 1 connected 0-5460
+id1 10.0.0.11:6379@16379,redis-cluster-leader-1 master - 0 1 2 connected 5461-10922
+id2 :0@0 master,noaddr - 0 0 0 disconnected`
+
+	csvOutput := csv.NewReader(strings.NewReader(output))
+	csvOutput.Comma = ' '
+	csvOutput.FieldsPerRecord = -1
+	rawNodes, err := csvOutput.ReadAll()
+	assert.NoError(t, err)
+
+	nodes := make([]clusterNodesResponse, 0, len(rawNodes))
+	for _, node := range rawNodes {
+		nodes = append(nodes, node)
+	}
+
+	known := knownClusterIPs(nodes)
+	assert.True(t, known["10.0.0.10"])
+	assert.True(t, known["10.0.0.11"])
+	assert.False(t, known["10.0.0.99"]) // a pod with this IP would be "missing"
+	assert.Len(t, known, 2)             // the noaddr node contributes no usable IP
+}
+
 func TestRepairDisconnectedMasters(t *testing.T) {
 	ctx := context.Background()
 	redisClient, mock := redismock.NewClientMock()
