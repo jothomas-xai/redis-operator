@@ -55,15 +55,16 @@ func TestCheckRedisNodePresence(t *testing.T) {
 }
 
 func TestCountClusterNodes(t *testing.T) {
-	// 3 healthy masters + 3 healthy slaves, plus one stale "master,fail" ghost
-	// (the kind left behind when a pod loses its identity after a restart).
+	// 3 healthy masters + 3 healthy slaves, plus a "master,fail" ghost and a
+	// "noaddr" ghost (both left behind when a pod loses its identity on restart).
 	output := `id-m0 10.0.0.10:6379@16379,redis-cluster-leader-0 myself,master - 0 1 1 connected 0-5460
 id-m1 10.0.0.11:6379@16379,redis-cluster-leader-1 master - 0 1 2 connected 5461-10922
 id-m2 10.0.0.12:6379@16379,redis-cluster-follower-2 master - 0 1 3 connected 10923-16383
 id-s0 10.0.0.13:6379@16379,redis-cluster-follower-0 slave id-m0 0 1 1 connected
 id-s1 10.0.0.14:6379@16379,redis-cluster-follower-1 slave id-m1 0 1 2 connected
 id-s2 10.0.0.15:6379@16379,redis-cluster-leader-2 slave id-m2 0 1 3 connected
-id-ghost 10.0.0.99:6379@16379,redis-cluster-leader-1 master,fail - 1700000000000 1700000000000 2 connected`
+id-ghost 10.0.0.99:6379@16379,redis-cluster-leader-1 master,fail - 1700000000000 1700000000000 2 connected
+id-noaddr :0@0 master,noaddr - 0 0 0 disconnected`
 
 	csvOutput := csv.NewReader(strings.NewReader(output))
 	csvOutput.Comma = ' '

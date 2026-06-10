@@ -416,12 +416,12 @@ func CheckRedisNodeCount(ctx context.Context, client kubernetes.Interface, cr *r
 }
 
 // countClusterNodes counts cluster nodes of the requested type ("leader",
-// "follower", or "" for every node), skipping any node the cluster has flagged
-// as failed. Stale "master,fail" ghosts - left behind when a pod loses its
-// identity after a restart - would otherwise be counted as live members,
-// inflating the leader and total node counts. That inflation traps
+// "follower", or "" for every node), skipping any stale node the cluster has
+// flagged as failed or with no address ("noaddr"). Such ghosts - left behind
+// when a pod loses its identity after a restart - would otherwise be counted as
+// live members, inflating the leader and total node counts. That inflation traps
 // reconciliation in an early-return loop and stops the operator from ever
-// reaching its relabel/repair logic.
+// reaching its relabel/repair/self-heal logic.
 func countClusterNodes(nodes []clusterNodesResponse, nodeType string) int32 {
 	var redisNodeType string
 	switch nodeType {
@@ -435,7 +435,7 @@ func countClusterNodes(nodes []clusterNodesResponse, nodeType string) int32 {
 
 	var count int32
 	for _, node := range nodes {
-		if nodeIsFailed(node) {
+		if nodeIsStale(node) {
 			continue
 		}
 		if redisNodeType == "" || nodeIsOfType(node, redisNodeType) {
